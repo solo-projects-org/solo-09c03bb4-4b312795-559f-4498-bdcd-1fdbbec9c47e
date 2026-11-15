@@ -37,5 +37,5 @@ curl -fsS -F "file=@$SAMPLES/02_backfill_resolves_ambiguity.csv" "$BASE/upload";
 say "GET /traffic AFTER backfill: pending list empty, every UTC pinned"
 curl -fsS "$BASE/traffic" | python3 -m json.tool
 
-say "batch audit trail (rejections persisted despite rollback)"
+say "batch audit trail: decisions in effectiveness order, rejection reasons persisted"
 curl -fsS "$BASE/batches" | python3 -m json.tool

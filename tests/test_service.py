@@ -1,4 +1,4 @@
-"""SQLite-backed service tests: atomic batches, conflicts, idempotency."""
+"""SQLite-backed service tests: atomic batches, conflicts, idempotency, audit."""
 
 import tempfile
 import unittest
@@ -6,10 +6,12 @@ from pathlib import Path
 
 from app.db import connect, init_db
 from app.service import (
+    AuditPersistError,
     ConflictError,
     IngestionError,
     UnresolvableTimelineError,
     ingest_batch,
+    list_audit,
     query_traffic,
 )
 from app.timeline import Record
@@ -34,18 +36,27 @@ class ServiceTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = Path(self.tmp.name) / "test.db"
         self.conn = connect(self.db_path)
-        self.audit_conn = connect(self.db_path)
         init_db(self.conn)
 
     def tearDown(self):
         self.conn.close()
-        self.audit_conn.close()
         self.tmp.cleanup()
 
     def _ingest(self, records):
-        return ingest_batch(
-            self.conn, records, audit_conn=self.audit_conn
-        )
+        return ingest_batch(self.conn, records)
+
+    def _audit_statuses(self):
+        return [
+            row[0]
+            for row in self.conn.execute(
+                "SELECT status FROM batch_audit ORDER BY id"
+            ).fetchall()
+        ]
+
+    def _record_count(self):
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM records"
+        ).fetchone()[0]
 
     def test_full_backfill_scenario(self):
         self._ingest(INITIAL)
@@ -84,9 +95,10 @@ class ServiceTests(unittest.TestCase):
         second = self._ingest(batch)
         self.assertEqual(second.inserted, [])
         self.assertEqual(second.skipped_duplicates, [128])
-        self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0], 1
-        )
+        self.assertEqual(self._record_count(), 1)
+        # a same-value re-upload is still a formal acceptance: both decisions
+        # have their own durable acceptance audit row
+        self.assertEqual(self._audit_statuses(), ["accepted", "accepted"])
 
     def test_same_id_different_value_rejects_whole_batch(self):
         self._ingest([r(128, "2024-11-03T01:20:00", 340)])
@@ -96,14 +108,13 @@ class ServiceTests(unittest.TestCase):
                 r(199, "2024-11-03T04:00:00", 10),
             ])
         # neither row of the rejected batch landed
-        self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0], 1
-        )
-        # the rejection itself is audited on the independent connection
-        audit = self.conn.execute(
-            "SELECT status FROM batch_audit ORDER BY id"
-        ).fetchall()
-        self.assertEqual([row[0] for row in audit], ["accepted", "rejected"])
+        self.assertEqual(self._record_count(), 1)
+        # the rejection itself is audited with its reason persisted
+        self.assertEqual(self._audit_statuses(), ["accepted", "rejected"])
+        rejected = self.conn.execute(
+            "SELECT reason FROM batch_audit WHERE status = 'rejected'"
+        ).fetchone()
+        self.assertIn("sample_id 128", rejected[0])
 
     def test_illegal_timeline_rejects_whole_batch(self):
         self._ingest([r(100, "2024-11-03T00:45:00", 120)])
@@ -112,9 +123,9 @@ class ServiceTests(unittest.TestCase):
                 r(5, "2024-11-03T03:00:00", 50),
                 r(15, "2024-11-03T00:30:00", 60),
             ])
-        self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0], 1
-        )
+        self.assertEqual(self._record_count(), 1)
+        # rejection reason persists even though the business rows rolled back
+        self.assertEqual(self._audit_statuses(), ["accepted", "rejected"])
 
     def test_backfill_infeasible_against_stored_data_is_rolled_back(self):
         self._ingest(INITIAL)
@@ -125,13 +136,8 @@ class ServiceTests(unittest.TestCase):
                 r(127, "2024-11-03T01:20:00", 80),
                 r(129, "2024-11-03T01:20:00", 84),
             ])
-        self.assertEqual(
-            self.conn.execute("SELECT COUNT(*) FROM records").fetchone()[0], 5
-        )
-        audit = self.conn.execute(
-            "SELECT status FROM batch_audit ORDER BY id"
-        ).fetchall()
-        self.assertEqual([row[0] for row in audit], ["accepted", "rejected"])
+        self.assertEqual(self._record_count(), 5)
+        self.assertEqual(self._audit_statuses(), ["accepted", "rejected"])
 
     def test_empty_batch_rejected(self):
         with self.assertRaises(IngestionError):
@@ -168,6 +174,88 @@ class ServiceTests(unittest.TestCase):
             parse_counter_csv(
                 b"sample_id,local_time,pass_count\n1,2024-11-03T01:20:00,-2\n"
             )
+
+    # ------------------------------------------------------------------
+    # Decision/audit atomicity (the regression this suite guards)
+    # ------------------------------------------------------------------
+
+    def _block_audit_writes(self) -> None:
+        """Make every insert into batch_audit fail (simulated audit outage)."""
+        self.conn.execute(
+            "CREATE TRIGGER fail_audit_insert BEFORE INSERT ON batch_audit "
+            "BEGIN SELECT RAISE(ABORT, 'injected audit failure'); END"
+        )
+
+    def test_acceptance_audit_failure_rolls_back_new_readings(self):
+        self._block_audit_writes()
+        with self.assertRaises(AuditPersistError):
+            self._ingest([r(128, "2024-11-03T01:20:00", 340)])
+        # no un-audited readings, no half-written audit row
+        self.assertEqual(self._record_count(), 0)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM batch_audit").fetchone()[0],
+            0,
+        )
+
+    def test_idempotent_reupload_also_requires_its_audit_row(self):
+        # first acceptance works and is audited
+        self._ingest([r(128, "2024-11-03T01:20:00", 340)])
+        self._block_audit_writes()
+        # the same-value re-upload cannot be acknowledged without a new audit
+        with self.assertRaises(AuditPersistError):
+            self._ingest([r(128, "2024-11-03T01:20:00", 340)])
+        self.assertEqual(self._record_count(), 1)
+        self.assertEqual(self._audit_statuses(), ["accepted"])
+
+    def test_rejection_audit_failure_is_an_error_not_a_recorded_reject(self):
+        self._ingest([r(128, "2024-11-03T01:20:00", 340)])
+        self._block_audit_writes()
+        with self.assertRaises(AuditPersistError):
+            self._ingest([r(128, "2024-11-03T01:20:00", 999)])
+        # the conflicting value never landed and no phantom rejection exists
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT pass_count FROM records WHERE sample_id = 128"
+            ).fetchone()[0],
+            340,
+        )
+        self.assertEqual(self._audit_statuses(), ["accepted"])
+
+    def test_rejected_batch_persists_reason_without_any_new_reading(self):
+        self._ingest([r(100, "2024-11-03T00:45:00", 120)])
+        with self.assertRaises(UnresolvableTimelineError):
+            self._ingest([
+                r(5, "2024-11-03T03:00:00", 50),
+                r(15, "2024-11-03T00:30:00", 60),
+            ])
+        self.assertEqual(self._record_count(), 1)
+        rows = list_audit(self.conn)
+        self.assertEqual([row["status"] for row in rows],
+                         ["accepted", "rejected"])
+        self.assertIn("no legal timeline", rows[1]["reason"])
+
+    def test_interleaved_decisions_are_listed_in_effectiveness_order(self):
+        self._ingest([r(100, "2024-11-03T00:45:00", 120)])          # accepted
+        with self.assertRaises(ConflictError):
+            self._ingest([r(100, "2024-11-03T00:45:00", 999)])      # rejected
+        self._ingest([r(160, "2024-11-03T02:15:00", 260)])          # accepted
+        with self.assertRaises(UnresolvableTimelineError):
+            self._ingest([
+                r(5, "2024-11-03T03:00:00", 50),
+                r(15, "2024-11-03T00:30:00", 60),
+            ])                                                        # rejected
+        self._ingest([r(180, "2024-11-03T03:10:00", 210)])          # accepted
+
+        rows = list_audit(self.conn)
+        self.assertEqual(
+            [row["status"] for row in rows],
+            ["accepted", "rejected", "accepted", "rejected", "accepted"],
+        )
+        # autoincrement ids are gapless and ordered exactly like the list
+        self.assertEqual([row["id"] for row in rows], [1, 2, 3, 4, 5])
+        # rejection reasons travel with their rows
+        self.assertIn("sample_id 100", rows[1]["reason"])
+        self.assertIn("no legal timeline", rows[3]["reason"])
 
 
 if __name__ == "__main__":

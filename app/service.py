@@ -2,6 +2,24 @@
 
 No web-framework imports here -- the layer is plain Python so it can be unit
 tested directly against SQLite.
+
+Consistency contract
+--------------------
+Every batch decision (accept or reject) and its ``batch_audit`` row are
+committed in **one** SQLite transaction:
+
+* an accepted batch -- including a fully idempotent re-upload -- is only
+  acknowledged when both its readings and its acceptance audit row commit;
+* a rejected batch inserts the audit row first and then rolls the whole
+  transaction back, so the rejection reason is durably retained while none
+  of its readings is ever stored;
+* if the audit row itself cannot be written, the transaction is rolled back
+  and :class:`AuditPersistError` is raised: the caller must report a failure,
+  never claim that the decision was recorded.
+
+Because writers take the write lock up front (``BEGIN IMMEDIATE``), the
+auto-increment audit id matches the order in which decisions actually become
+effective, even when acceptances and rejections interleave.
 """
 
 from __future__ import annotations
@@ -36,6 +54,26 @@ class UnresolvableTimelineError(IngestionError):
     status_code = 422
 
 
+class AuditPersistError(Exception):
+    """Raised when the decision's audit row cannot be durably written.
+
+    The business transaction is rolled back before this is raised, so no
+    un-audited readings remain.  Mapped to HTTP 500: the operator must know
+    the audit trail itself is broken instead of receiving a false receipt.
+    """
+
+    status_code = 500
+
+    def __init__(self, status: str, cause: BaseException):
+        message = (
+            f"failed to persist {status} audit row; batch decision rolled back "
+            f"and must not be treated as recorded: {cause}"
+        )
+        super().__init__(message)
+        self.reason = message
+        self.audit_status = status
+
+
 @dataclass
 class IngestionResult:
     batch_ref: str
@@ -52,39 +90,44 @@ def _all_rows(conn: sqlite3.Connection) -> dict[int, sqlite3.Row]:
     return {row["sample_id"]: row for row in rows}
 
 
-def _write_audit(
-    audit_conn: sqlite3.Connection | None,
+def _insert_audit(
+    conn: sqlite3.Connection,
     batch_ref: str,
     status: str,
     reason: str | None,
     count: int,
 ) -> None:
-    """Persist audit on the independent autocommit connection.
+    """Insert the audit row on the active write transaction.
 
-    Audit rows therefore survive the rollback of a rejected business batch.
-    When no audit connection is supplied (unit tests) the entry is skipped.
+    Any SQLite failure is converted to :class:`AuditPersistError`; the caller
+    rolls the transaction back, so the decision never takes effect without
+    its audit trail.
     """
 
-    if audit_conn is None:
-        return
-    audit_conn.execute(
-        "INSERT INTO batch_audit (batch_ref, status, reason, record_count) "
-        "VALUES (?, ?, ?, ?)",
-        (batch_ref, status, reason, count),
-    )
+    try:
+        conn.execute(
+            "INSERT INTO batch_audit (batch_ref, status, reason, record_count) "
+            "VALUES (?, ?, ?, ?)",
+            (batch_ref, status, reason, count),
+        )
+    except sqlite3.Error as exc:
+        raise AuditPersistError(status, exc) from exc
 
 
 def ingest_batch(
     conn: sqlite3.Connection,
     records: list[Record],
-    audit_conn: sqlite3.Connection | None = None,
 ) -> IngestionResult:
-    """Atomically accept or reject one CSV batch.
+    """Atomically decide and audit one CSV batch.
 
     Rules:
       * same sample id + same content -> idempotent skip (accepted once);
       * same sample id + different content -> whole batch rejected (409);
       * merged set admits no legal timeline -> whole batch rejected (422).
+
+    Readings and the audit row share one transaction, so a success receipt is
+    only returned after both have committed and a rejection is either fully
+    recorded (reason persisted, no readings stored) or reported as a 500.
     """
 
     if not records:
@@ -145,12 +188,16 @@ def ingest_batch(
                     "increasing UTC instants across the DST transition"
                 ))
 
-            # 3) commit the new rows
+            # 3) insert the new readings ...
             tx.executemany(
                 "INSERT INTO records (sample_id, local_time, pass_count) "
                 "VALUES (?, ?, ?)",
                 [(r.sample_id, r.local_time, r.pass_count) for r in new_records],
             )
+            # 4) ... and the acceptance audit row in the SAME transaction.
+            # A failure here rolls the readings back as well, so no success
+            # receipt is ever given without a durable audit record.
+            _insert_audit(tx, batch_ref, "accepted", None, len(records))
             accepted_result = IngestionResult(
                 batch_ref=batch_ref,
                 accepted=True,
@@ -160,16 +207,20 @@ def ingest_batch(
             )
     except _Rollback as exc:
         rejection = exc.error
+    # AuditPersistError (and any other unexpected sqlite3 error) escapes here:
+    # write_transaction has already rolled back, so nothing was committed.
 
-    # The write lock is released here; the audit connection can always write,
-    # and rejection entries survive the business transaction rollback.
     if rejection is not None:
-        _write_audit(
-            audit_conn, batch_ref, "rejected", rejection.reason, len(records)
-        )
+        # Rejections keep their durable reason while their readings roll back:
+        # write the audit row in its own transaction and commit it *before*
+        # raising. If even that write fails, AuditPersistError propagates
+        # (nothing is committed) instead of a falsely "recorded" rejection.
+        with write_transaction(conn) as tx:
+            _insert_audit(
+                tx, batch_ref, "rejected", rejection.reason, len(records)
+            )
         raise rejection
 
-    _write_audit(audit_conn, batch_ref, "accepted", None, len(records))
     assert accepted_result is not None
     return accepted_result
 
@@ -243,9 +294,16 @@ def query_traffic(conn: sqlite3.Connection) -> dict:
 
 
 def list_audit(conn: sqlite3.Connection) -> list[dict]:
+    """Audit trail ordered by decision effectiveness (the autoincrement id).
+
+    The write lock serializes all decisions, so this order is exactly the
+    order in which the batch transactions committed, regardless of whether
+    individual batches were accepted or rejected.
+    """
+
     with read_transaction(conn) as tx:
         rows = tx.execute(
-            "SELECT batch_ref, status, reason, record_count, created_at "
+            "SELECT id, batch_ref, status, reason, record_count, created_at "
             "FROM batch_audit ORDER BY id"
         ).fetchall()
     return [dict(row) for row in rows]

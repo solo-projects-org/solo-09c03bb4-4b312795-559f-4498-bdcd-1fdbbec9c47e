@@ -1,4 +1,10 @@
-"""SQLite persistence with serialized writers and snapshot reads."""
+"""SQLite persistence with serialized writers and snapshot reads.
+
+There is deliberately only *one* connection factory: batch readings and the
+batch audit live in the same database file and are written inside the same
+transaction, so an accept can never commit without its audit row and a
+rejected batch can never leave readings behind.
+"""
 
 from __future__ import annotations
 
@@ -32,26 +38,26 @@ def get_db_path() -> Path:
 
 
 def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
+    """Open a short-lived connection (autocommit mode, WAL, busy timeout).
+
+    ``check_same_thread=False`` keeps the connection usable from the request
+    handler thread that owns it; callers must not share one connection across
+    threads concurrently.  Each request opens its own connection instead.
+    """
+
     path = Path(db_path) if db_path is not None else DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=30, isolation_level=None)
+    conn = sqlite3.connect(
+        str(path),
+        timeout=30,
+        isolation_level=None,
+        check_same_thread=False,
+    )
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     conn.execute("PRAGMA busy_timeout=30000;")
     conn.execute("PRAGMA synchronous=NORMAL;")
-    return conn
-
-
-def audit_connect(db_path: Path | str | None = None) -> sqlite3.Connection:
-    """Separate autocommit connection.
-
-    Rejected batches must leave an audit trail even though their business
-    transaction is rolled back, so audit rows are written through this
-    connection outside the writer transaction.
-    """
-
-    conn = connect(db_path)
     return conn
 
 
@@ -66,7 +72,8 @@ def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     Only one writer exists at any moment, so two concurrent batches can never
     interleave their validation/insertion and accept mutually conflicting data.
     Contenders block on busy_timeout and then observe the winner's committed
-    state when re-validating.
+    state when re-validating.  The audit row is written inside this same
+    transaction, which makes every batch decision atomic.
     """
 
     conn.execute("BEGIN IMMEDIATE;")

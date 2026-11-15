@@ -47,20 +47,17 @@ class ConcurrencyTests(unittest.TestCase):
 
         def worker(count: int):
             conn = connect(self.db_path)
-            audit = connect(self.db_path)
             barrier.wait()  # maximize lock contention
             try:
                 ingest_batch(
                     conn,
                     [r(128, "2024-11-03T01:20:00", count)],
-                    audit_conn=audit,
                 )
                 kind = "accepted"
             except IngestionError:
                 kind = "rejected"
             finally:
                 conn.close()
-                audit.close()
             with lock:
                 outcomes.append(kind)
 
@@ -90,14 +87,17 @@ class ConcurrencyTests(unittest.TestCase):
         ]
         self.assertEqual(statuses.count("accepted"), 1)
         self.assertEqual(statuses.count("rejected"), 3)
+        # every decision has exactly one audit row: nothing silently un-audited
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM batch_audit").fetchone()[0],
+            4,
+        )
         conn.close()
 
     def test_parallel_batches_leave_a_legal_warehouse(self):
         writer = connect(self.db_path)
-        writer_audit = connect(self.db_path)
-        ingest_batch(writer, SEED, audit_conn=writer_audit)
+        ingest_batch(writer, SEED)
         writer.close()
-        writer_audit.close()
 
         barrier = threading.Barrier(5)
         lock = threading.Lock()
@@ -105,10 +105,9 @@ class ConcurrencyTests(unittest.TestCase):
 
         def worker(payload):
             conn = connect(self.db_path)
-            audit = connect(self.db_path)
             barrier.wait()
             try:
-                ingest_batch(conn, payload, audit_conn=audit)
+                ingest_batch(conn, payload)
                 kind = "accepted"
             except ConflictError:
                 kind = "conflict"
@@ -116,7 +115,6 @@ class ConcurrencyTests(unittest.TestCase):
                 kind = "illegal"
             finally:
                 conn.close()
-                audit.close()
             with lock:
                 kinds.append(kind)
 
@@ -166,8 +164,7 @@ class ConcurrencyTests(unittest.TestCase):
 
     def test_reads_never_mix_old_verdicts_with_new_rows(self):
         writer = connect(self.db_path)
-        writer_audit = connect(self.db_path)
-        ingest_batch(writer, SEED, audit_conn=writer_audit)
+        ingest_batch(writer, SEED)
 
         views: list[int] = []
         stop = threading.Event()
@@ -204,18 +201,87 @@ class ConcurrencyTests(unittest.TestCase):
                 ingest_batch(
                     writer,
                     [r(sid, f"2024-11-03T04:{minute:02d}:00", sid)],
-                    audit_conn=writer_audit,
                 )
         finally:
             stop.set()
             for t in readers:
                 t.join(timeout=30)
         writer.close()
-        writer_audit.close()
 
         # every observed view shows a whole-warehouse size (never a partial mix)
         self.assertTrue(set(views).issubset(set(range(2, 13))))
         self.assertGreater(len(views), 0)
+
+    def test_audit_order_matches_decision_effectiveness_under_contention(self):
+        # Mixed accept/reject batches race through the same write lock.
+        # The audit trail must contain one row per decision in the exact order
+        # the serialized transactions became effective (gapless ids).  Each
+        # pair targets a fresh sample id, so both outcomes are always valid
+        # regardless of which thread wins the lock first.
+        jobs = [
+            # (payload, result if it reaches the lock first, result if second)
+            ([r(10, "2024-11-03T00:10:00", 1)], {"accepted", "rejected"}),
+            ([r(10, "2024-11-03T00:10:00", 2)], {"accepted", "rejected"}),
+            ([r(20, "2024-11-03T00:20:00", 3)], {"accepted", "rejected"}),
+            ([r(20, "2024-11-03T00:20:00", 4)], {"accepted", "rejected"}),
+            ([r(30, "2024-11-03T00:30:00", 5)], {"accepted", "rejected"}),
+            ([r(30, "2024-11-03T00:30:00", 6)], {"accepted", "rejected"}),
+        ]
+        barrier = threading.Barrier(len(jobs))
+        lock = threading.Lock()
+        errors: list[BaseException] = []
+
+        def runner(payload, allowed):
+            barrier.wait()
+            conn = connect(self.db_path)
+            try:
+                try:
+                    ingest_batch(conn, payload)
+                    kind = "accepted"
+                except ConflictError:
+                    kind = "rejected"
+                if kind not in allowed:  # pragma: no cover - failure path
+                    raise AssertionError(f"unexpected outcome {kind}")
+            except BaseException as exc:  # pragma: no cover - failure path
+                with lock:
+                    errors.append(exc)
+            finally:
+                conn.close()
+
+        threads = [
+            threading.Thread(target=runner, args=job, daemon=True) for job in jobs
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertEqual(errors, [])
+
+        conn = connect(self.db_path)
+        rows = conn.execute(
+            "SELECT id, status FROM batch_audit ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(rows), 6)
+        self.assertEqual([row[0] for row in rows], [1, 2, 3, 4, 5, 6])
+        statuses = [row[1] for row in rows]
+        # exactly one winner and one rejection per contended sample id
+        self.assertEqual(statuses.count("accepted"), 3)
+        self.assertEqual(statuses.count("rejected"), 3)
+        # rejected rows carry their durable reason
+        reasons = [
+            row[0]
+            for row in conn.execute(
+                "SELECT reason FROM batch_audit WHERE status = 'rejected'"
+            ).fetchall()
+        ]
+        self.assertEqual(len(reasons), 3)
+        self.assertTrue(all("already stored with different content" in x
+                            for x in reasons))
+        # only the three accepted readings exist
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM records").fetchone()[0], 3
+        )
+        conn.close()
 
 
 if __name__ == "__main__":
